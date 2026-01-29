@@ -15,40 +15,16 @@
  * - --port <number>: HTTP port for HTTP transport (overrides MCP_PORT)
  */
 
+import { parseCliConfig } from "../dist/cli/config.js";
+
 // Parse command line arguments
 const args = process.argv.slice(2);
-let transport = process.env.MCP_TRANSPORT || 'stdio';
-let port = parseInt(process.env.MCP_PORT || '3000', 10);
-
-for (let i = 0; i < args.length; i++) {
-  const arg = args[i];
-  
-  // Handle --transport flag
-  if (arg === '--transport' && args[i + 1]) {
-    transport = args[i + 1];
-    i++; // Skip next arg
-    continue;
-  }
-  
-  // Handle --port flag
-  if (arg === '--port' && args[i + 1]) {
-    port = parseInt(args[i + 1], 10);
-    i++; // Skip next arg
-    continue;
-  }
-  
-  // Handle environment variables passed as arguments (KEY=value format)
-  const match = arg.match(/^([^=]+)=(.*)$/);
-  if (match) {
-    const [, key, value] = match;
-    process.env[key] = value.replace(/^["'](.*)["']$/, '$1'); // Remove quotes if present
-  }
-}
+const { transport, port, portRaw, updatedEnv, usedDeprecatedSse } = parseCliConfig(args, process.env);
+Object.assign(process.env, updatedEnv);
 
 // Support legacy 'sse' transport name (map to 'http')
-if (transport === 'sse') {
+if (usedDeprecatedSse) {
   console.warn("Warning: 'sse' transport is deprecated. Using 'http' (Streamable HTTP) instead.");
-  transport = 'http';
 }
 
 // Validate transport
@@ -59,7 +35,7 @@ if (!['stdio', 'http'].includes(transport)) {
 
 // Validate port
 if (isNaN(port) || port < 1 || port > 65535) {
-  console.error(`Invalid port: ${port}. Must be a number between 1 and 65535.`);
+  console.error(`Invalid port: ${portRaw}. Must be a number between 1 and 65535.`);
   process.exit(1);
 }
 
