@@ -2,36 +2,78 @@
  * IcePanel API client
  */
 
-import type { 
-  ModelObjectsResponse, 
-  ModelObjectResponse, 
-  CatalogTechnologyResponse, 
-  TeamsResponse, 
-  TeamResponse,
+import type {
+  ModelObjectsResponse,
+  ModelObjectResponse,
+  CatalogTechnologyResponse,
   ModelConnectionsResponse,
   ModelConnectionResponse,
   CreateModelObjectRequest,
   UpdateModelObjectRequest,
   CreateConnectionRequest,
   UpdateConnectionRequest,
-  CreateTeamRequest,
-  UpdateTeamRequest,
   CreateTagRequest,
   UpdateTagRequest,
   TagResponse,
   CreateDomainRequest,
   UpdateDomainRequest,
   DomainResponse,
-} from "./types.js";
+} from "../types.js";
+
+const DEFAULT_API_BASE_URL = "https://api.icepanel.io/v1";
+const DEFAULT_API_TIMEOUT_MS = 30000;
+const DEFAULT_API_MAX_RETRIES = 2;
+const DEFAULT_API_RETRY_BASE_DELAY_MS = 300;
+const MAX_API_RETRIES = 5;
+const MAX_API_RETRY_BASE_DELAY_MS = 5000;
+
+function parseEnvInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (!raw) {
+    return fallback;
+  }
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.min(Math.max(value, min), max);
+}
+
+function isTruthyEnv(value: string | undefined): boolean {
+  return value === "1" || value === "true" || value === "TRUE" || value === "yes" || value === "YES";
+}
+
+function getValidatedApiBaseUrl(): string {
+  const raw = process.env.ICEPANEL_API_BASE_URL || DEFAULT_API_BASE_URL;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("ICEPANEL_API_BASE_URL must be a valid URL");
+  }
+
+  const isInsecureAllowed = isTruthyEnv(process.env.ICEPANEL_API_ALLOW_INSECURE);
+  if (parsed.protocol === "http:" && !isInsecureAllowed) {
+    throw new Error("ICEPANEL_API_BASE_URL must use https unless ICEPANEL_API_ALLOW_INSECURE is true");
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error("ICEPANEL_API_BASE_URL must use http or https");
+  }
+
+  return parsed.toString().replace(/\/$/, "");
+}
 
 // Base URL for the IcePanel API
 // Use environment variable if set, otherwise default to production URL
-const API_BASE_URL = process.env.ICEPANEL_API_BASE_URL || "https://api.icepanel.io/v1";
+const API_BASE_URL = getValidatedApiBaseUrl();
 
-// Get the API key from environment variables
-const API_KEY = process.env.API_KEY;
-
-// Note: We don't check for API_KEY here as main.ts handles this
+function getApiKey(): string {
+  const apiKey = process.env.API_KEY;
+  if (!apiKey) {
+    throw new Error("API_KEY environment variable is not set");
+  }
+  return apiKey;
+}
 
 /**
  * Custom error class for IcePanel API errors with status code
@@ -43,13 +85,48 @@ export class IcePanelApiError extends Error {
     public body?: any
   ) {
     super(`IcePanel API error: ${status} ${statusText}`);
-    this.name = 'IcePanelApiError';
+    this.name = "IcePanelApiError";
   }
+}
+
+const API_TIMEOUT_MS = parseEnvInt("ICEPANEL_API_TIMEOUT_MS", DEFAULT_API_TIMEOUT_MS, 1000, 120000);
+const API_MAX_RETRIES = parseEnvInt("ICEPANEL_API_MAX_RETRIES", DEFAULT_API_MAX_RETRIES, 0, MAX_API_RETRIES);
+const API_RETRY_BASE_DELAY_MS = parseEnvInt(
+  "ICEPANEL_API_RETRY_BASE_DELAY_MS",
+  DEFAULT_API_RETRY_BASE_DELAY_MS,
+  50,
+  MAX_API_RETRY_BASE_DELAY_MS
+);
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function isRetryableError(error: unknown, externalAbort: boolean): boolean {
+  if (externalAbort) {
+    return false;
+  }
+  if (error instanceof IcePanelApiError) {
+    return isRetryableStatus(error.status);
+  }
+  if (error instanceof Error) {
+    return error.name === "AbortError" || error instanceof TypeError;
+  }
+  return false;
+}
+
+function getRetryDelay(attempt: number): number {
+  const delay = API_RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+  return Math.min(delay, MAX_API_RETRY_BASE_DELAY_MS);
 }
 
 /**
  * Handle API errors with actionable messages per mcp-builder skill guidelines
- * 
+ *
  * @param error - The caught error
  * @returns A user-friendly error message with guidance
  */
@@ -57,14 +134,14 @@ export function handleApiError(error: unknown): string {
   if (error instanceof IcePanelApiError) {
     switch (error.status) {
       case 400:
-        return "Error: Invalid request. Check that all required fields are provided and IDs are 20 characters. " + 
-               (error.body?.message ? `Details: ${error.body.message}` : "");
+        return "Error: Invalid request. Check that all required fields are provided and IDs are 20 characters. " +
+          (error.body?.message ? `Details: ${error.body.message}` : "");
       case 401:
         return "Error: Authentication failed. Verify your API_KEY is correct and has not expired.";
       case 403:
         return "Error: Permission denied. Your API key may only have read access. Generate a new key with write permissions.";
       case 404:
-        return "Error: Resource not found. Verify the landscapeId and object IDs are correct. Use getModelObjects to find valid IDs.";
+        return "Error: Resource not found. Verify the landscapeId and object IDs are correct. Use icepanel_list_model_objects to find valid IDs.";
       case 409:
         return "Error: Conflict. The resource may have been modified by another user. Fetch the latest version and try again.";
       case 422:
@@ -85,34 +162,74 @@ async function apiRequest<T = any>(path: string, options: RequestInit = {}): Pro
   const url = `${API_BASE_URL}${path}`;
 
   const headers = {
-    "Accept": "application/json",
+    Accept: "application/json",
     "Content-Type": "application/json",
-    "Authorization": `ApiKey ${API_KEY}`,
+    Authorization: `ApiKey ${getApiKey()}`,
     ...options.headers,
   };
 
-  const response = await fetch(url, {
-    ...options,
-    headers,
-  });
+  const method = (options.method || "GET").toUpperCase();
+  const canRetry = method === "GET" || method === "HEAD";
 
-  if (!response.ok) {
-    let body: any;
-    try {
-      body = await response.json();
-    } catch {
-      // Body not JSON, that's fine
+  for (let attempt = 0; attempt <= API_MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+    const abortListener = () => controller.abort();
+
+    if (options.signal) {
+      if (options.signal.aborted) {
+        controller.abort();
+      } else {
+        options.signal.addEventListener("abort", abortListener, { once: true });
+      }
     }
-    throw new IcePanelApiError(response.status, response.statusText, body);
+
+    try {
+      const response = await fetch(url, {
+        ...options,
+        headers,
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const rawText = await response.text();
+        let body: any;
+        try {
+          body = JSON.parse(rawText);
+        } catch {
+          body = rawText || undefined;
+        }
+
+        const apiError = new IcePanelApiError(response.status, response.statusText, body);
+        if (canRetry && attempt < API_MAX_RETRIES && isRetryableStatus(response.status)) {
+          await sleep(getRetryDelay(attempt));
+          continue;
+        }
+        throw apiError;
+      }
+
+      // Handle 204 No Content (for DELETE operations)
+      if (response.status === 204) {
+        return {} as T;
+      }
+
+      const data = await response.json();
+      return data as T;
+    } catch (error) {
+      if (canRetry && attempt < API_MAX_RETRIES && isRetryableError(error, options.signal?.aborted ?? false)) {
+        await sleep(getRetryDelay(attempt));
+        continue;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+      if (options.signal) {
+        options.signal.removeEventListener("abort", abortListener);
+      }
+    }
   }
 
-  // Handle 204 No Content (for DELETE operations)
-  if (response.status === 204) {
-    return {} as T;
-  }
-
-  const data = await response.json();
-  return data as T;
+  throw new Error("Unexpected error in apiRequest");
 }
 
 /**
@@ -130,19 +247,19 @@ function buildFilterParams(filter: Record<string, unknown>): URLSearchParams {
   Object.entries(filter).forEach(([key, value]) => {
     if (value === undefined) return;
 
-    if (key === 'labels' && typeof value === 'object' && value !== null) {
+    if (key === "labels" && typeof value === "object" && value !== null) {
       // Handle labels object
       Object.entries(value as Record<string, string>).forEach(([labelKey, labelValue]) => {
         params.append(`filter[labels][${labelKey}]`, labelValue);
       });
     } else if (Array.isArray(value)) {
       // Handle array values
-      value.forEach(item => {
+      value.forEach((item) => {
         params.append(`filter[${key}][]`, String(item));
       });
     } else if (value === null) {
       // Handle null values
-      params.append(`filter[${key}]`, 'null');
+      params.append(`filter[${key}]`, "null");
     } else {
       // Handle simple values
       params.append(`filter[${key}]`, String(value));
@@ -188,16 +305,16 @@ export async function getVersion(landscapeId: string, versionId: string = "lates
 export async function getCatalogTechnologies(
   options: {
     filter?: {
-      provider?: string | string[] | null,
-      type?: string | string[] | null,
-      restrictions?: string | string[],
-      status?: string | string[]
-    }
+      provider?: string | string[] | null;
+      type?: string | string[] | null;
+      restrictions?: string | string[];
+      status?: string | string[];
+    };
   } = {}
 ) {
   const params = options.filter ? buildFilterParams(options.filter) : new URLSearchParams();
   const queryString = params.toString();
-  const url = `/catalog/technologies${queryString ? `?${queryString}` : ''}`;
+  const url = `/catalog/technologies${queryString ? `?${queryString}` : ""}`;
 
   return apiRequest(url) as Promise<CatalogTechnologyResponse>;
 }
@@ -219,30 +336,18 @@ export async function getOrganizationTechnologies(
   organizationId: string,
   options: {
     filter?: {
-      provider?: string | string[] | null,
-      type?: string | string[] | null,
-      restrictions?: string | string[],
-      status?: string | string[]
-    }
+      provider?: string | string[] | null;
+      type?: string | string[] | null;
+      restrictions?: string | string[];
+      status?: string | string[];
+    };
   } = {}
 ) {
   const params = options.filter ? buildFilterParams(options.filter) : new URLSearchParams();
   const queryString = params.toString();
-  const url = `/organizations/${organizationId}/technologies${queryString ? `?${queryString}` : ''}`;
+  const url = `/organizations/${organizationId}/technologies${queryString ? `?${queryString}` : ""}`;
 
   return apiRequest(url) as Promise<CatalogTechnologyResponse>;
-}
-
-/**
- * Get teams for an organization
- *
- * Retrieves a list of teams from an organization
- *
- * @param organizationId - The ID of the organization
- * @returns Promise with teams response
- */
-export async function getTeams(organizationId: string) {
-  return apiRequest(`/organizations/${organizationId}/teams`) as Promise<TeamsResponse>;
 }
 
 /**
@@ -251,20 +356,22 @@ export async function getTeams(organizationId: string) {
 export async function getModelObjects(
   landscapeId: string,
   versionId: string = "latest",
-  options: { filter?: {
-    domainId?: string | string[],
-    external?: boolean,
-    handleId?: string | string[],
-    labels?: Record<string, string>,
-    name?: string,
-    parentId?: string | null,
-    status?: string | string[],
-    type?: string | string[]
-  }} = {}
+  options: {
+    filter?: {
+      domainId?: string | string[];
+      external?: boolean;
+      handleId?: string | string[];
+      labels?: Record<string, string>;
+      name?: string;
+      parentId?: string | null;
+      status?: string | string[];
+      type?: string | string[];
+    };
+  } = {}
 ): Promise<ModelObjectsResponse> {
   const params = options.filter ? buildFilterParams(options.filter) : new URLSearchParams();
   const queryString = params.toString();
-  const url = `/landscapes/${landscapeId}/versions/${versionId}/model/objects${queryString ? `?${queryString}` : ''}`;
+  const url = `/landscapes/${landscapeId}/versions/${versionId}/model/objects${queryString ? `?${queryString}` : ""}`;
 
   return apiRequest(url) as Promise<ModelObjectsResponse>;
 }
@@ -272,8 +379,14 @@ export async function getModelObjects(
 /**
  * Get a specific model object
  */
-export async function getModelObject(landscapeId: string, modelObjectId: string, versionId: string = "latest") {
-  return apiRequest(`/landscapes/${landscapeId}/versions/${versionId}/model/objects/${modelObjectId}`) as Promise<ModelObjectResponse>;
+export async function getModelObject(
+  landscapeId: string,
+  modelObjectId: string,
+  versionId: string = "latest"
+) {
+  return apiRequest(
+    `/landscapes/${landscapeId}/versions/${versionId}/model/objects/${modelObjectId}`
+  ) as Promise<ModelObjectResponse>;
 }
 
 /**
@@ -298,19 +411,19 @@ export async function getModelConnections(
   versionId: string = "latest",
   options: {
     filter?: {
-      direction?: 'outgoing' | 'bidirectional' | null,
-      handleId?: string | string[],
-      labels?: Record<string, string>,
-      name?: string,
-      originId?: string | string[],
-      status?: ('deprecated' | 'future' | 'live' | 'removed') | ('deprecated' | 'future' | 'live' | 'removed')[],
-      targetId?: string | string[]
-    }
+      direction?: "outgoing" | "bidirectional" | null;
+      handleId?: string | string[];
+      labels?: Record<string, string>;
+      name?: string;
+      originId?: string | string[];
+      status?: ("deprecated" | "future" | "live" | "removed") | ("deprecated" | "future" | "live" | "removed")[];
+      targetId?: string | string[];
+    };
   } = {}
 ): Promise<ModelConnectionsResponse> {
   const params = options.filter ? buildFilterParams(options.filter) : new URLSearchParams();
   const queryString = params.toString();
-  const url = `/landscapes/${landscapeId}/versions/${versionId}/model/connections${queryString ? `?${queryString}` : ''}`;
+  const url = `/landscapes/${landscapeId}/versions/${versionId}/model/connections${queryString ? `?${queryString}` : ""}`;
 
   return apiRequest(url) as Promise<ModelConnectionsResponse>;
 }
@@ -318,8 +431,14 @@ export async function getModelConnections(
 /**
  * Get a specific connection
  */
-export async function getConnection(landscapeId: string, versionId: string, connectionId: string): Promise<ModelConnectionResponse> {
-  return apiRequest(`/landscapes/${landscapeId}/versions/${versionId}/model/connections/${connectionId}`) as Promise<ModelConnectionResponse>;
+export async function getConnection(
+  landscapeId: string,
+  versionId: string,
+  connectionId: string
+): Promise<ModelConnectionResponse> {
+  return apiRequest(
+    `/landscapes/${landscapeId}/versions/${versionId}/model/connections/${connectionId}`
+  ) as Promise<ModelConnectionResponse>;
 }
 
 // ============================================================================
@@ -328,7 +447,7 @@ export async function getConnection(landscapeId: string, versionId: string, conn
 
 /**
  * Create a new model object
- * 
+ *
  * @param landscapeId - The landscape ID
  * @param data - The model object data to create
  * @param versionId - The version ID (defaults to "latest")
@@ -350,7 +469,7 @@ export async function createModelObject(
 
 /**
  * Update an existing model object
- * 
+ *
  * @param landscapeId - The landscape ID
  * @param modelObjectId - The model object ID to update
  * @param data - The fields to update
@@ -374,7 +493,7 @@ export async function updateModelObject(
 
 /**
  * Delete a model object
- * 
+ *
  * @param landscapeId - The landscape ID
  * @param modelObjectId - The model object ID to delete
  * @param versionId - The version ID (defaults to "latest")
@@ -427,41 +546,6 @@ export async function deleteConnection(
 ): Promise<void> {
   await apiRequest(
     `/landscapes/${landscapeId}/versions/${versionId}/model/connections/${connectionId}`,
-    { method: "DELETE" }
-  );
-}
-
-// ============================================================================
-// Team Write Operations
-// ============================================================================
-
-export async function createTeam(
-  organizationId: string,
-  data: CreateTeamRequest
-): Promise<TeamResponse> {
-  return apiRequest<TeamResponse>(
-    `/organizations/${organizationId}/teams`,
-    { method: "POST", body: JSON.stringify(data) }
-  );
-}
-
-export async function updateTeam(
-  organizationId: string,
-  teamId: string,
-  data: UpdateTeamRequest
-): Promise<TeamResponse> {
-  return apiRequest<TeamResponse>(
-    `/organizations/${organizationId}/teams/${teamId}`,
-    { method: "PATCH", body: JSON.stringify(data) }
-  );
-}
-
-export async function deleteTeam(
-  organizationId: string,
-  teamId: string
-): Promise<void> {
-  await apiRequest(
-    `/organizations/${organizationId}/teams/${teamId}`,
     { method: "DELETE" }
   );
 }

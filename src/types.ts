@@ -96,25 +96,6 @@ export interface CatalogTechnologyResponse {
   catalogTechnologies: CatalogTechnology[];
 }
 
-export interface Team {
-  color: string;
-  name: string;
-  userIds: string[];
-  createdAt: string;
-  createdBy: string;
-  createdById: string;
-  id: string;
-  modelObjectHandleIds: string[];
-  organizationId: string;
-  updatedAt: string;
-  updatedBy: string;
-  updatedById: string;
-}
-
-export interface TeamsResponse {
-  teams: Team[];
-}
-
 export interface ModelConnectionDirection {
   direction: 'outgoing' | 'bidirectional' | null;
 }
@@ -187,8 +168,6 @@ export interface CreateModelObjectRequest {
   labels?: Record<string, string>;
   links?: Record<string, { name: string; url: string }>;
   tagIds?: string[];
-  teamIds?: string[];
-  teamOnlyEditing?: boolean;
   technologyIds?: string[];
   domainId?: string;
   handleId?: string;
@@ -209,8 +188,6 @@ export interface UpdateModelObjectRequest {
   labels?: Record<string, string>;
   links?: Record<string, { name: string; url: string }>;
   tagIds?: string[];
-  teamIds?: string[];
-  teamOnlyEditing?: boolean;
   technologyIds?: string[];
 }
 
@@ -243,29 +220,6 @@ export interface UpdateConnectionRequest {
 }
 
 /**
- * Request body for creating a team
- */
-export interface CreateTeamRequest {
-  name: string;
-  color?: string;
-}
-
-/**
- * Request body for updating a team
- */
-export interface UpdateTeamRequest {
-  name?: string;
-  color?: string;
-}
-
-/**
- * Response for single team
- */
-export interface TeamResponse {
-  team: Team;
-}
-
-/**
  * Tag entity
  */
 export interface Tag {
@@ -282,7 +236,7 @@ export interface Tag {
 export interface CreateTagRequest {
   name: string;
   color?: string;
-  tagGroupId?: string;
+  groupId: string;
 }
 
 /**

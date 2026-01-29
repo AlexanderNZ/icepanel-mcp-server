@@ -67,7 +67,7 @@ if (isNaN(port) || port < 1 || port > 65535) {
 process.env._MCP_TRANSPORT = transport;
 process.env._MCP_PORT = String(port);
 
-import('../dist/main.js').catch(err => {
+import('../dist/index.js').catch(err => {
   console.error('Failed to start IcePanel MCP Server:', err);
   process.exit(1);
 });
