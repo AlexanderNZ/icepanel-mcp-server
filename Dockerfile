@@ -38,10 +38,18 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/bin ./bin
 
 # Environment variables (to be provided at runtime)
-# API_KEY - Your IcePanel API key (required)
-# ORGANIZATION_ID - Your IcePanel organization ID (required)
-# ICEPANEL_API_BASE_URL - Optional API base URL override
+# Required:
+#   API_KEY - Your IcePanel API key
+#   ORGANIZATION_ID - Your IcePanel organization ID
+# Optional:
+#   ICEPANEL_API_BASE_URL - Override API base URL
+#   MCP_TRANSPORT - Transport type: 'stdio' (default) or 'http'
+#   MCP_PORT - HTTP port for Streamable HTTP transport (default: 3000)
 
-# Run the MCP server via stdio transport
+# Default port for HTTP transport (can be overridden with --port flag)
+EXPOSE 3000
+
+# Run the MCP server
+# Supports CLI flags: --transport <stdio|http> --port <number>
+# Example: docker run -p 3000:3000 ... icepanel-mcp-server --transport http --port 3000
 ENTRYPOINT ["node", "bin/icepanel-mcp-server.js"]
-
